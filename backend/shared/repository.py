@@ -72,6 +72,11 @@ class TanksRepo:
         item = response.get("Item")
         return _decode(item) if item is not None else None
 
+    def list_tanks(self) -> list[dict]:
+        """All registered tanks (scan; fine at this fleet size)."""
+        response = self.table.scan()
+        return [_decode(item) for item in response.get("Items", [])]
+
     def put_tank(self, tank: Mapping[str, Any]) -> None:
         if not tank.get("tankId"):
             raise ValueError("tank needs a tankId")
@@ -181,3 +186,95 @@ class DynamoAlertStore(AlertStore):
                 }
             )
         )
+
+
+class EventsRepo:
+    """Device event rows (section 6.3) on the alerts table.
+
+    Stored under ``SK = EVT#<ts>#<type>`` so event rows never mix with
+    ``ALERT#`` records or ``COOLDOWN#`` markers sharing the partition.
+    """
+
+    def __init__(self, table: Any) -> None:
+        self.table = table
+
+    def put_event(self, event: Mapping[str, Any]) -> None:
+        tank_id = event.get("tankId")
+        if not tank_id:
+            raise ValueError("event needs a tankId")
+        ts = event.get("ts")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            raise ValueError("event needs a numeric ts")
+        event_type = event.get("eventType", event.get("type"))
+        if not event_type:
+            raise ValueError("event needs a type")
+        item = dict(event)
+        item["tankId"] = tank_id
+        item["eventType"] = event_type
+        item["sk"] = f"EVT#{ts}#{event_type}"
+        self.table.put_item(Item=_encode(item))
+
+    def query_events(
+        self, tank_id: str, from_ts: float, to_ts: float
+    ) -> list[dict]:
+        response = self.table.query(
+            KeyConditionExpression=Key("tankId").eq(tank_id)
+            & Key("sk").begins_with("EVT#")
+        )
+        rows = []
+        for item in response.get("Items", []):
+            row = _decode(item)
+            ts = row.get("ts")
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                continue
+            if from_ts <= float(ts) <= to_ts:
+                rows.append(row)
+        rows.sort(key=lambda row: float(row["ts"]))
+        return rows
+
+
+class DailyRepo:
+    """Per-day aggregates keyed by ``(tankId, date)``; puts overwrite."""
+
+    def __init__(self, table: Any) -> None:
+        self.table = table
+
+    def put_daily(self, record: Mapping[str, Any]) -> None:
+        if not record.get("tankId"):
+            raise ValueError("daily record needs a tankId")
+        if not record.get("date"):
+            raise ValueError("daily record needs a date")
+        self.table.put_item(Item=_encode(dict(record)))
+
+    def get_daily(self, tank_id: str, date: str) -> Optional[dict]:
+        response = self.table.get_item(Key={"tankId": tank_id, "date": date})
+        item = response.get("Item")
+        return _decode(item) if item is not None else None
+
+    def get_recent_nightly_rates(
+        self, tank_id: str, before_date: str, n: int = 7
+    ) -> list[dict]:
+        """Recent baseline nights, most recent first.
+
+        Only nights that produced a clean fitted rate
+        (``nightlyRatePctPerHr`` present) and were NOT flagged as leaks
+        qualify, so leak nights never pollute future baselines.
+        """
+        response = self.table.query(
+            KeyConditionExpression=Key("tankId").eq(tank_id)
+        )
+        nights = []
+        for item in response.get("Items", []):
+            row = _decode(item)
+            if not row.get("date") or str(row["date"]) >= before_date:
+                continue
+            rate = row.get("nightlyRatePctPerHr")
+            if (
+                isinstance(rate, bool)
+                or not isinstance(rate, (int, float))
+                or row.get("nightLeakFlagged")
+            ):
+                continue
+            nights.append({"rate": float(rate), "date": str(row["date"])})
+        nights.sort(key=lambda night: night["date"], reverse=True)
+        return nights[: max(n, 0)]

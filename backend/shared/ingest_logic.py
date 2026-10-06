@@ -187,3 +187,45 @@ def process_telemetry(
         "latest_updated": latest_updated,
         "alert": alert_result,
     }
+
+
+def process_event(
+    message: Mapping[str, Any],
+    tanks_repo: Any,
+    events_repo: Any,
+    now_ts: float,
+) -> dict:
+    """Validate and store one device event message (section 6.3 shape).
+
+    Unknown tankIds are logged and dropped, like telemetry. Never raises
+    on bad messages: problems come back in the result dict.
+    """
+    if not isinstance(message, dict):
+        return {"ok": False, "reason": "invalid_message", "detail": "not an object"}
+    tank_id = message.get("tankId", message.get("tank_id"))
+    if not isinstance(tank_id, str) or not tank_id:
+        return {"ok": False, "reason": "invalid_message", "detail": "tankId required"}
+    if tanks_repo.get_tank(tank_id) is None:
+        logger.warning("Dropping event for unknown tankId %r", tank_id)
+        return {"ok": False, "reason": "unknown_tank", "tank_id": tank_id}
+
+    event_type = message.get("eventType", message.get("type"))
+    if not isinstance(event_type, str) or not event_type:
+        return {"ok": False, "reason": "invalid_message", "detail": "type required"}
+
+    ts = message.get("ts", message.get("timestamp", now_ts))
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return {"ok": False, "reason": "invalid_message", "detail": "ts not numeric"}
+    if math.isnan(ts) or not math.isfinite(ts):
+        return {"ok": False, "reason": "invalid_message", "detail": "ts not finite"}
+
+    event = {
+        "tankId": tank_id,
+        "ts": float(ts),
+        "eventType": event_type,
+    }
+    for key in ("reason", "cause", "pumpOn", "pump_on", "levelPct", "level_pct"):
+        if message.get(key) is not None:
+            event[key] = message[key]
+    events_repo.put_event(event)
+    return {"ok": True, "stored": True, "tank_id": tank_id, "event_type": event_type}
